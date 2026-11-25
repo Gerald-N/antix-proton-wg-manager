@@ -105,27 +105,47 @@ def list_profiles_privileged() -> dict:
 
 # ---------------------------------------------------------------- status
 def get_status() -> dict:
-    """Read-only kernel status. Uses /usr/bin/wg directly (unprivileged)."""
+    """Read-only kernel status."""
     result = {"state": "disconnected", "interface": None, "detail": ""}
+    
     try:
-        proc = privilege.run_privileged([settings.WG_PATH, "show", "interfaces"], timeout=5)
-        if proc.returncode != 0:
-            err = proc.stderr.strip()
-            if "permission" in err.lower():
-                result["state"] = "error"
-                result["detail"] = "Permission denied reading wg interfaces"
-            return result
-        interfaces = proc.stdout.strip().split()
-        if not interfaces:
-            return result
-        iface = interfaces[0]
-        result["interface"] = iface
-        hs = privilege.run_privileged([settings.WG_PATH, "show", iface, "latest-handshakes"], timeout=5)
+        # 1. Check for WireGuard interfaces using 'ip link' (no root required)
+        ip_proc = subprocess.run(
+            ["/usr/sbin/ip", "link", "show"],
+            capture_output=True, text=True, timeout=5, check=False
+        )
+        
+        # Look for lines like "5: proton: <POINTOPOINT,NOARP,UP,LOWER_UP>"
+        wg_iface = None
+        for line in ip_proc.stdout.splitlines():
+            if "wireguard" in line.lower() or ": proton:" in line or ": wg" in line:
+                # Extract the name between the first set of colons
+                parts = line.split(":")
+                if len(parts) >= 2:
+                    candidate = parts[1].strip()
+                    # Simple heuristic: our VPN interfaces usually have no dots
+                    if "." not in candidate:
+                        wg_iface = candidate
+                        break
+        
+        if not wg_iface:
+            return result  # Truly disconnected
+            
+        result["interface"] = wg_iface
+        result["state"] = "connected"  # If the interface exists, assume it's up
+
+        # 2. Try to get handshake data (needs root)
+        hs = subprocess.run(
+            [settings.WG_PATH, "show", wg_iface, "latest-handshakes"],
+            capture_output=True, text=True, timeout=5, check=False
+        )
+        
         if hs.returncode != 0:
-            if "permission" in hs.stderr.lower():
-                result["state"] = "error"
-                result["detail"] = f"Permission denied reading {iface} handshake"
+            # We are connected but can't read details
+            result["detail"] = "Connected (unprivileged status)"
             return result
+
+        # Parse handshakes to see if it's truly active
         now = time.time()
         active = False
         for line in hs.stdout.strip().splitlines():
@@ -137,21 +157,21 @@ def get_status() -> dict:
                         break
                 except ValueError:
                     pass
+                    
         if active:
             result["state"] = "connected"
+            result["detail"] = ""
         else:
             result["state"] = "disconnected"
             result["detail"] = "Interface up, no recent handshake"
-    except subprocess.TimeoutExpired:
-        result["state"] = "error"; result["detail"] = "wg command timed out"
-    except FileNotFoundError:
-        result["state"] = "error"; result["detail"] = "wg command not found"
+            
     except Exception as e:
-        result["state"] = "error"; result["detail"] = f"Unexpected error: {e}"
+        result["state"] = "error"
+        result["detail"] = f"Unexpected error: {e}"
+        
     return result
 
 
-# ---------------------------------------------------------------- privileged connect/disconnect
 def _run_privileged_wg(action: str, profile: str) -> dict:
     if action not in ALLOWED_ACTIONS:
         return {"success": False, "code": -1, "message": "Invalid action."}
