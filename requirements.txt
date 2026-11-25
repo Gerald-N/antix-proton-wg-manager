@@ -1,0 +1,5 @@
+# GTK 3 and PyGObject should be installed through Debian packages:
+# python3-gi
+# gir1.2-gtk-3.0
+#
+# No additional Python dependencies are required initially.
